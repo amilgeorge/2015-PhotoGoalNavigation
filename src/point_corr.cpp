@@ -29,6 +29,7 @@
 #include "TooN/so3.h"
 #include "TooN/se3.h"
 
+
 using namespace cv;
 using namespace std;
 
@@ -59,6 +60,10 @@ pthread_mutex_t image2lock = PTHREAD_MUTEX_INITIALIZER;
 
 tum_ardrone::filter_stateConstPtr quad_poseConstPtr;
 
+IplImage*  status_image ;
+int status_image_width=2*640;
+int status_image_height=2*360+50;
+
 struct quad_considered_pose {
 
 	float x;
@@ -79,10 +84,12 @@ struct command_log{
 
 command_log current_momentum;
 command_log position_T_minus2,position_Tminus1,positionT;
-
 quad_considered_pose quad_considered_pose_obj;
 
 int log_count;
+
+bool target_pose_achieved ;
+double target_pose_achieved_time ;
 
 struct Xgreater {
 	bool operator()(const DMatch& matchx, const DMatch& matchr) const {
@@ -91,7 +98,10 @@ struct Xgreater {
 	}
 };
 
-void update_image_in_status_figure(Mat image1,Mat image2 );
+void update_matched_image_in_status_figure(Mat matched_image);
+void update_target_image_in_status_figure(Mat image1);
+void update_current_image_in_status_figure(Mat image1);
+void update_command_sent_status(string status);
 
 int  run_homography_and_validate(vector<DMatch> matches,vector<KeyPoint> keyPoints1, vector<KeyPoint> keyPoints2, Mat image1,Mat image2);
 
@@ -126,6 +136,11 @@ float calculate_step_size(float current,float target){
 
 	return step;
 }
+
+float calculate_step_size1(float current,float target){
+	return target-current;
+}
+
 
 void log_go_to_command(float target_x,float target_y,float target_z,float target_yaw){
 
@@ -162,6 +177,25 @@ command_log calculate_go_to_command(quad_considered_pose considered_pose,float t
 
 	return com_goto;
 }
+
+command_log calculate_go_to_command2(quad_considered_pose considered_pose,float target_x,float target_y,float target_z,float target_yaw){
+	float step_x,step_y,step_z,step_yaw;
+
+	step_x = calculate_step_size1(considered_pose.x,target_x);
+	step_y = calculate_step_size1(considered_pose.y, target_y);
+	step_z = calculate_step_size1(considered_pose.z, target_z);
+	step_yaw = calculate_step_size1(considered_pose.yaw, target_yaw);
+
+	float factor=0.5;
+	command_log com_goto;
+	com_goto.x = considered_pose.x + factor * step_x;
+	com_goto.y = considered_pose.y + factor * step_y;
+	com_goto.z = considered_pose.z + factor * step_z;
+	com_goto.yaw = considered_pose.yaw +factor * step_yaw;
+
+	return com_goto;
+}
+
 
 void update_momentum(){
 
@@ -200,8 +234,16 @@ void gotoCommand(float x, float y, float z, float yaw) {
 	char buf[50];
 	sprintf(buf, "c goto %f %f %f %f", x, y, z, yaw);
 	msg.data = buf;
+
+	//cout << "going to publish"  << endl ;
 	pub_com.publish(msg);
 
+
+	target_pose_achieved=false ;
+	string status(buf);
+	update_command_sent_status(status.substr(6));
+
+	//cout << "published"  << endl ;
 }
 
 void moveByRelCommand(float x, float y, float z, float yaw) {
@@ -320,7 +362,7 @@ void ratio_test_for_matches(vector<DMatch> &passed_matches, vector<vector<DMatch
 	}
  	Mat img_matches;
         drawMatches(image1, keyPoints1, image2, keyPoints2, passed_matches,img_matches, Scalar::all(-1), Scalar::all(-1), vector<char>(),DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
-	imshow("matches_after_ratio_test", img_matches);
+	//imshow("matches_after_ratio_test", img_matches);
 
 	cout << "No of matches received " << k_matches.size() << " for ratio test. No of matches that passed ratio test " << passed_matches.size() << endl ;
 
@@ -368,8 +410,11 @@ void getGoodMatches(vector<DMatch> &good_matches, vector<DMatch> matches,
 			img_matches, Scalar::all(-1), Scalar::all(-1), vector<char>(),
 			DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
 
+	cout << "Checking size of images: image1 size" << image1.size() << "image2 size" << image2.size() <<  "img_matches size" << img_matches.size() << endl ;
+
 	//-- Show good matches
-	imshow("good_matches", img_matches);
+	update_matched_image_in_status_figure(img_matches);
+	//imshow("good_matches", img_matches);
 
 	//		for (int i = 0; i < (int) good_matches.size(); i++) {
 	//			printf("-- Good Match [%d] Keypoint 1: %d  -- Keypoint 2: %d  \n",
@@ -478,13 +523,13 @@ int calculate(Mat image1) {
 
 	//getFramesFromVideo(image2);
 
+
+
 	if (!image2.data)                             // Check for invalid input
 	{
 		cout << "Could not open or find the image2" << std::endl;
 		return 0;
 	}
-
-	update_image_in_status_figure(image1,image2);
 
 	Mat gray1;
 
@@ -652,6 +697,8 @@ void transform_cordinates_and_send(Mat validR, Mat validT) {
 	rod2rpyToon(globalCameraPose.get_rotation(),&global_camera_roll,&global_camera_pitch,&global_camera_yaw);
 	cout << "\nglobal_camera_roll:: "<<global_camera_roll << " global_camera_pitch:: " << global_camera_pitch<< "global_camera_yaw:: " << global_camera_yaw <<endl;
 
+
+
 	//new_camera_center.at<float>(0,0)=0;
 	//new_camera_center.at<float>(0,1)=0;
 	//new_camera_center.at<float>(0,2)=1;
@@ -713,7 +760,14 @@ void transform_cordinates_and_send(Mat validR, Mat validT) {
 	cout << "\nyaw from method1 :: " << final_yaw << "\nyaw from method2:: " << yaw_again << "\nusing method 1" << endl;
 
 	cout << "\nsending command X="<< final_x_position << " Y=" << final_y_position << " Z=" << final_z_position << " Yaw=" << final_yaw << endl;
-	command_log com_goto = calculate_go_to_command(quad_considered_pose_obj,final_x_position,final_y_position,final_z_position,final_yaw);
+
+
+	final_x_position=globalCameraPose.get_translation()[0];
+	final_y_position=globalCameraPose.get_translation()[1];
+	final_z_position=globalCameraPose.get_translation()[2];
+	final_yaw=global_camera_yaw;
+
+	command_log com_goto = calculate_go_to_command2(quad_considered_pose_obj,final_x_position,final_y_position,final_z_position,final_yaw);
 
 	update_momentum();
     cout<<"Momentum_x : "<<current_momentum.x << endl ;
@@ -724,7 +778,11 @@ void transform_cordinates_and_send(Mat validR, Mat validT) {
 	cout << "\nPose X:: " << X << " Pose Y:: " << Y << " Pose Z:: " << Z << endl;
 
 	//gotoCommand(com_goto.x, com_goto.y, com_goto.z, final_yaw);
-	gotoCommand(final_x_position,final_y_position,final_z_position,final_yaw);
+
+
+
+	log_go_to_command(com_goto.x,com_goto.y,com_goto.z,com_goto.yaw);
+	gotoCommand(com_goto.x,com_goto.y,com_goto.z,com_goto.yaw);
 
 }
 
@@ -754,21 +812,26 @@ void setConsideredPose() {
 
 void imageCallback(const sensor_msgs::ImageConstPtr& msg) {
 
+	if(debug_mode){
+			return  ;
+		}
+
 //cout << "image callback received" << endl ;
+
+	Mat image1 = cv_bridge::toCvShare(msg, "bgr8")->image;
+	Mat undistort_image1;
+	undistort(image1, undistort_image1, K1, distCoeff);
+	image1 = undistort_image1;
+
+	update_current_image_in_status_figure(image1);
 
 	try {
 		pthread_mutex_lock(&image2lock);
 		if (keyboardEventReceived) {
 			cout << "going to process current frame " << endl;
 			setConsideredPose();
-			Mat image1 = cv_bridge::toCvShare(msg, "bgr8")->image;
-			Mat undistort_image1;
-			undistort(image1, undistort_image1, K1, distCoeff);
+
 			int status = 0;
-
-			image1 = undistort_image1;
-
-
 			status = calculate(image1);
 			//status=1 ; //comment this when u uncomment previous line
 			if (status == 1) {
@@ -834,21 +897,32 @@ int run_homography_and_validate(vector<DMatch> matches,vector<KeyPoint> keyPoint
         vector<Mat> rotation_matrices;
         vector<Mat> translation_matrices ;
         vector<Mat> normals ;
+
+        cout << "Decomposing homography to R and T" << endl ;
+
+
         decomposeHomographyMat(H, K1, rotation_matrices,translation_matrices,normals);
+
+        cout << "Decomposed homography to R and T" << endl ;
 
 	Mat Rotation_1 = rotation_matrices[0];
 	Mat Rotation_2 = rotation_matrices[1];
+	cout << "\nR1=" << Rotation_1 << endl ;
+	 cout << "\nR2=" << Rotation_2  << endl ;
+
 	Mat Translation_1 = translation_matrices[0];
 	Mat Translation_2 = translation_matrices[1];
+
+    cout << "\nT1=" << Translation_1 <<  endl ;
+    cout << "\nT2=" << Translation_2 << endl ;
+
+
 	Mat Normal_1=normals[0];
 	Mat Normal_2=normals[1];
 	Mat Normal_3=normals[2];
 	Mat Normal_4=normals[3];
 
-        cout << "\nR1=" << Rotation_1 << endl ;
-        cout << "\nR2=" << Rotation_2  << endl ;
-        cout << "\nT1=" << Translation_1 <<  endl ;
-        cout << "\nT2=" << Translation_2 << endl ;
+
 
         cout << "\nN1=" << Normal_1 << endl ;
         cout << "\nN2=" << Normal_2 << endl ;
@@ -1245,46 +1319,139 @@ int run_eight_point_algo_on_matches(vector<DMatch> matches,
 
 }
 
-void update_image_in_status_figure(Mat image1,Mat image2 ){
+void update_matched_image_in_status_figure(Mat matched_image){
+
+	IplImage matched_image_ptr = (IplImage)matched_image;
+	//IplImage img2 = (IplImage)image2;
 
 
+	cvSetImageROI(status_image, cvRect(0, matched_image_ptr.height+50,matched_image_ptr.width, matched_image_ptr.height) );
+	cvCopy(&matched_image_ptr,status_image,NULL);
+	cvResetImageROI(status_image);
+
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+	imshow("status_image",dstMat);
+
+
+}
+
+void reset_background_with_black(int start_x, int start_y, int width,int height){
+	IplImage* img1_zeros=cvCreateImage(cvSize(width,height),IPL_DEPTH_8U,3);
+	cvSet(img1_zeros, cvScalar(0,0,0));
+
+	cvSetImageROI(status_image, cvRect(start_x, start_y,width,height) );
+	cvCopy(img1_zeros,status_image,NULL);
+	cvResetImageROI(status_image);
+}
+
+void update_command_sent_status(string command_sent){
+	reset_background_with_black((status_image_width/2)-1,0 ,status_image_width/2,50);
+
+	string status_msg="Command Sent: "+ command_sent;
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+
+	putText(dstMat,status_msg,cvPoint(650,10), FONT_HERSHEY_PLAIN, 0.8, Scalar(0,0,255),1.5);
+	imshow("status_image",dstMat);
+
+}
+
+void update_command_executed_status(string command_executed){
+	reset_background_with_black((status_image_width/2)-1,25,status_image_width/2,25);
+	string status_msg="Command Executed: "+ command_executed;
+
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+	putText(dstMat,status_msg,cvPoint(650,40), FONT_HERSHEY_PLAIN, 0.8, Scalar(0,255,0),1.5);
+	imshow("status_image",dstMat);
+
+}
+
+void update_quad_status_message(string status){
+
+	reset_background_with_black(0,0,status_image_width/2,50);
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+
+	putText(dstMat,status,cvPoint(30,30), FONT_HERSHEY_PLAIN, 2, Scalar(255,0,0),2);
+	imshow("status_image",dstMat);
+
+}
+
+
+void update_current_image_in_status_figure(Mat image1){
+
+
+	//cout << "updating image status" << endl ;
 	IplImage img1 = (IplImage)image1;
-	IplImage img2 = (IplImage)image2;
-
-	int dstWidth=img1.width+img1.width;
-	int dstHeight=img1.height+img1.height;
-
-	IplImage* dst=cvCreateImage(cvSize(dstWidth,dstHeight),IPL_DEPTH_8U,3);
 
 	// Copy first image to dst
-	cvSetImageROI(dst, cvRect(0, 0,img1.width,img1.height) );
-	//Mat image_roi = dst(cvRect(0, 0,img1->width,img1->height));
-	cvCopy(&img1,dst,NULL);
-	cvResetImageROI(dst);
+	cvSetImageROI(status_image, cvRect(0, 50,img1.width,img1.height) );
+	cvCopy(&img1,status_image,NULL);
+	cvResetImageROI(status_image);
+
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+	putText(dstMat,"Quadcopter View",cvPoint(30,350), FONT_HERSHEY_PLAIN, 2, Scalar(0,0,255),2);
+
+	imshow("status_image",dstMat);
+
+
+
+}
+
+void update_target_image_in_status_figure(Mat image2){
+
+
+	IplImage img2 = (IplImage)image2;
 
 	// Copy second image to dst
-	cvSetImageROI(dst, cvRect(img2.width, 0,img2.width,img2.height) );
-	cvCopy(&img2,dst,NULL);
-	cvResetImageROI(dst);
+	cvSetImageROI(status_image, cvRect(img2.width, 50,img2.width,img2.height) );
+	cvCopy(&img2,status_image,NULL);
+	cvResetImageROI(status_image);
 
-	cvShowImage( "status_image", dst );
 
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+	putText(dstMat,"Target View",cvPoint(670,350), FONT_HERSHEY_PLAIN, 2, Scalar(0,0,255),2);
+
+	imshow("status_image",dstMat);
 
 }
 
 void targetImageCallback(const std_msgs::String::ConstPtr& msg ){
 
 	pthread_mutex_lock(&image2lock);
-	char*	target_image_name= msg->data.c_str();
-	cout << "Target image is " << target_image_name << endl ;
 
-//	char* target_image_full_path = "/usr/prakt/w041/" ;
-//	strcat(target_image_full_path,target_image_name);
-//	cout << "Target image full path " << target_image_full_path << endl ;
+	char* target_image_name= (char*)msg->data.c_str();
+	cout << "Target image is " << target_image_name << endl ;
 //
-//	image2 = imread(target_image_full_path,CV_LOAD_IMAGE_COLOR);
-	//update_image_in_status_figure(,image2);
+	char target_image_full_path[200] = "/usr/prakt/w041/" ;
+//
+	strcat(target_image_full_path,target_image_name);
+	cout << "Target image full path " << target_image_full_path << endl ;
+
+	image2 = imread(target_image_full_path,CV_LOAD_IMAGE_COLOR);
+
+
+	Mat undistort_image2;
+	undistort(image2, undistort_image2, K1, distCoeff);
+	image2 = undistort_image2;
+
+	update_target_image_in_status_figure(image2);
+	Mat image1=imread("/usr/prakt/w041/video_seq_images3_z/frame0088.jpg", CV_LOAD_IMAGE_COLOR) ;
+
+		if (!image1.data)                             // Check for invalid input
+		{
+				 cout << "Could not open or find the image1" << std::endl;
+
+		}
+
+	Mat undistort_image1;
+	undistort(image1,undistort_image1,K1,distCoeff);
+	image1 = undistort_image1 ;
+
 	pthread_mutex_unlock(&image2lock);
+
+
+
+	calculate(image1);
+
 }
 
 bool check_if_within_theshold(float cur_pos,float target_pos,float threshold){
@@ -1301,47 +1468,86 @@ string getDroneStatus(int status){
 //# 6: Taking off, 7: Goto Fix Point, 8: Landing, 9: Looping
 //# Note: 3,7 seems to discriminate type of flying (isFly = 3 | 7)
 
+	//cout << "finding status string for status" << status  << endl ;
 	if (status == 0){
-		status_string == "UNKNOWN";
+		status_string = "UNKNOWN";
 	}else if(status == 1){
-		status_string == "Init";
+		status_string = "Init";
 	}else if(status == 2){
-		status_string == "Landed";
+		status_string = "Landed";
 	}else if(status == 3){
-		status_string == "Flying";
+		status_string = "Flying";
 	}else if(status == 4){
-		status_string == "Hovering";
+		status_string = "Hovering";
 	}else if(status == 5){
-		status_string == "Test";
+		status_string = "Test";
 	}else if(status == 6){
-		status_string == "Taking off";
+		status_string = "Taking off";
 	}else if(status == 7){
-		status_string == "Goto Fix Point";
+		status_string = "Goto Fix Point";
 	}else if(status == 8){
-		status_string == "Landing";
+		status_string = "Landing";
 	}else if(status == 9){
-		status_string == "Looping";
+		status_string = "Looping";
 	}
+	//cout << "finding status string for status" << status_string  << endl ;
+
 	return status_string;
 }
 
 void droneposeCb(const tum_ardrone::filter_stateConstPtr statePtr) {
 	//cout << "callback received for drone pose!!" << endl;
-	//cout << "x" << statePtr->x << " y" << statePtr->y << " z" << statePtr->z << endl;
-	//float pos_threshold = 0.7;
+
+
 	quad_poseConstPtr = statePtr;
 
-//	if(check_if_within_theshold(quad_poseConstPtr->x,positionT.x,pos_threshold)
-//				&& check_if_within_theshold(quad_poseConstPtr->y,positionT.y,pos_threshold)
-//					&& check_if_within_theshold(quad_poseConstPtr->z,positionT.z,pos_threshold) ){
+	float x=quad_poseConstPtr->x;
+	float y=quad_poseConstPtr->y;
+	float z=quad_poseConstPtr->z;
+	float yaw=quad_poseConstPtr->yaw;
+
+	float pos_threshold=0.5;
+
+	//cout <<"X: " << x << " positionT.x: " << positionT.x << " Diff: " << fabs(x - positionT.x) << endl ;
+	//cout <<"Y: " << y << " positionT.y: " << positionT.y << " Diff: " << fabs(y - positionT.y) << endl ;
+	//cout <<"Z: " << z << " positionT.z: " << positionT.z << " Diff: " << fabs(z - positionT.z) << endl ;
+
+	if(check_if_within_theshold(x,positionT.x,pos_threshold) && check_if_within_theshold(y,positionT.y,pos_threshold)
+			&& check_if_within_theshold(z,positionT.z,pos_threshold) ){
+
+		//cout << "Received pose is within threshold" << endl ;
+		if(!target_pose_achieved){
+			//cout << "Setting target pose achieved to true" << endl ;
+			target_pose_achieved=true ;
+			target_pose_achieved_time = ros::Time::now().toSec();
+		}else {
+			double current_time=ros::Time::now().toSec();
+			double diff_time=current_time-target_pose_achieved_time;
+			//cout << "Diff time for pose within target pose" << diff_time << endl ;
+			if(diff_time >= 5 ){
+				char buf[50];
+				sprintf(buf, "%f %f %f %f", statePtr->x, statePtr->y, statePtr->z, statePtr->yaw);
+				string status_msg(buf) ;
+				//cout << "Pose achieved!!!" << endl ;
+				update_command_executed_status(status_msg);
+			}
+
+		}
+
+
+
 //
 //
-//	}
+	}else {
+		//cout << "Received pose is out of threshold" << endl;
+		target_pose_achieved=false ;
+	}
 
+	int drone_state=quad_poseConstPtr->droneState;
 
+	string status_msg=getDroneStatus(drone_state);
+	update_quad_status_message(status_msg);
 
-
-	//setConsideredPose();
 }
 
 
@@ -1352,13 +1558,13 @@ int main(int argc, char **argv) {
 
 
 	ros::NodeHandle nh;
-	cv::namedWindow("matches_after_ratio_test",cv::WINDOW_NORMAL);
-	cv::startWindowThread();
+//	cv::namedWindow("matches_after_ratio_test",cv::WINDOW_NORMAL);
+	//cv::startWindowThread();
 //
 //	//cv::namedWindow("matches", cv::WINDOW_NORMAL);
 //	//cv::startWindowThread();
-	cv::namedWindow("good_matches", cv::WINDOW_NORMAL);
-	cv::startWindowThread();
+//	cv::namedWindow("good_matches", cv::WINDOW_NORMAL);
+//	cv::startWindowThread();
 
 	cv::namedWindow("warped_image_1", cv::WINDOW_NORMAL);
 	cv::startWindowThread();
@@ -1373,8 +1579,7 @@ int main(int argc, char **argv) {
 //
 	//Mat K1 = Mat(3,3, CV_32F, cvScalar(0.));
 
-	cv::namedWindow("handy_image", cv::WINDOW_NORMAL);
-	cv::startWindowThread();
+
 //
 //	//to check opencv version //compatibe with 2 not 3
 	if (CV_MAJOR_VERSION < 3) {
@@ -1407,6 +1612,18 @@ int main(int argc, char **argv) {
 			 cout << "Could not open or find the image1" << std::endl;
                 			return 0;
 	}
+
+
+
+
+	status_image=cvCreateImage(cvSize(status_image_width,status_image_height),IPL_DEPTH_8U,3);
+
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+	putText(dstMat,"Quadcopter View",cvPoint(30,350), FONT_HERSHEY_PLAIN, 2, Scalar(0,0,255,255),2);
+	putText(dstMat,"Target View",cvPoint(670,350), FONT_HERSHEY_PLAIN, 2, Scalar(0,0,255,255),2);
+
+		//cvShowImage( "status_image", dst );
+	imshow("status_image",dstMat);
 
 	vector<float> distCoeff;// = [-0.525878 0.321315 0.000212 -0.000429 0.000000];
 		// 1
@@ -1458,15 +1675,13 @@ int main(int argc, char **argv) {
 	undistort(image1,undistort_image1,K1,distCoeff);
 	image1 = undistort_image1 ;
 
-	Mat undistort_image2;
-	undistort(image2, undistort_image2, K1, distCoeff);
-	image2 = undistort_image2;
+
 
 //
 //	//Size size(640, 360);                        //the dst image size,e.g.100x100
 //	// resize(input, image1, size);                             //resize image
 //
-	cv::imshow("handy_image", image2);
+//	cv::imshow("handy_image", image2);
 //
 //	cout << "going to subscibe" << endl;
 
@@ -1482,7 +1697,7 @@ int main(int argc, char **argv) {
 	ros::Subscriber target_image_sub = nh.subscribe("photo_goal/target_image", 10,
                         targetImageCallback);
 
-	calculate(image1);
+	//calculate(image1);
 	//Mat validR = Mat::eye(3, 3, CV_32F);
 	//validR = rpy2rod(30,30, 0);
 

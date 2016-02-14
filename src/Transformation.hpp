@@ -85,7 +85,8 @@ TooN::SE3<float> getCurrentFrontToGlobalTransformation(float newX, float newY, f
 	TooN::SE3<float> globalToFront;
 	TooN::SE3<float> frontToGlobal;
 	TooN::SE3<float> droneToGlobal;
-	const TooN::SE3<float> droneToFront = TooN::SE3<float>(TooN::SO3<float>(TooN::makeVector(3.14159265/2,0,0)),TooN::makeVector(0,0.025,-2.0));
+	//0.025 -0.2
+	const TooN::SE3<float> droneToFront = TooN::SE3<float>(TooN::SO3<float>(TooN::makeVector(3.14159265/2,0,0)),TooN::makeVector(0,0,0.0));
 	const TooN::SE3<float> frontToDrone = droneToFront.inverse();
 
 	// set se3
