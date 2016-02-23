@@ -38,6 +38,7 @@ using namespace std;
 Mat image2;
 bool keyboardEventReceived = false;
 int frame_no = 1;
+bool image_2_reached=true ;
 
 // float focal_length_x=0.771557;
 // float focal_length_y=1.368560;
@@ -54,6 +55,7 @@ vector<float> distCoeff;
 Mat K1 = Mat(3, 3, CV_32F, cvScalar(0.));
 
 ros::Publisher pub_com;
+ros::Publisher pub_clear_com;
 
 pthread_mutex_t logControl_CS = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t image2lock = PTHREAD_MUTEX_INITIALIZER;
@@ -63,6 +65,7 @@ tum_ardrone::filter_stateConstPtr quad_poseConstPtr;
 IplImage*  status_image ;
 int status_image_width=2*640;
 int status_image_height=2*360+50;
+bool debug_mode=false;
 
 struct quad_considered_pose {
 
@@ -98,14 +101,25 @@ struct Xgreater {
 	}
 };
 
+void set_target_achieved_status();
 void update_matched_image_in_status_figure(Mat matched_image);
 void update_target_image_in_status_figure(Mat image1);
 void update_current_image_in_status_figure(Mat image1);
 void update_command_sent_status(string status);
+void reset_momentum();
 
 int  run_homography_and_validate(vector<DMatch> matches,vector<KeyPoint> keyPoints1, vector<KeyPoint> keyPoints2, Mat image1,Mat image2);
 
-int run_eight_point_algo_on_matches(vector<DMatch> matches,
+void send_clear_command(){
+
+	std_msgs::String empty_msg;
+	pub_clear_com.publish(empty_msg);
+
+}
+
+int run_eight_point_algo_on_matches(vector<DMatch> matches,vector<KeyPoint> keyPoints1, vector<KeyPoint> keyPoints2, Mat image1, Mat image2);
+
+int run_eight_point_algo_on_matches1(vector<DMatch> matches,
 		vector<KeyPoint> keyPoints1, vector<KeyPoint> keyPoints2, Mat image1,
 		Mat image2);
 
@@ -236,6 +250,7 @@ void gotoCommand(float x, float y, float z, float yaw) {
 	msg.data = buf;
 
 	//cout << "going to publish"  << endl ;
+	send_clear_command();
 	pub_com.publish(msg);
 
 
@@ -560,16 +575,31 @@ int calculate(Mat image1) {
                 matches.push_back(m[0]);
         }
 
+        //Either use matches or passed_matches or good_matches
+
 	int status = 0;
-	//Either use matches or passed_matches or good_matches
-	if (good_matches.size() >= 8) {
-		cout << "Going to run 8 point algo" << endl;
-		cout << "No of points" << good_matches.size() << endl ;
-		//status = run_eight_point_algo_on_matches(good_matches, keyPoints1,keyPoints2, image1, image2);
-		status=run_homography_and_validate(good_matches, keyPoints1,keyPoints2, image1, image2);
-	} else {
-		cout << "not enough points for homography/8-point algo " << endl;
+	int use_homography=true;
+
+	if(use_homography){
+		if (good_matches.size() >= 4) {
+				cout << "Going to run homography" << endl;
+				cout << "No of points" << good_matches.size() << endl ;
+				status=run_homography_and_validate(good_matches, keyPoints1,keyPoints2, image1, image2);
+			} else {
+				cout << "not enough points for homography" << endl;
+			}
+	}else {
+		if (passed_matches.size() >= 8) {
+				cout << "Going to run 8 point algo" << endl;
+				cout << "No of points" << good_matches.size() << endl ;
+				status = run_eight_point_algo_on_matches1(passed_matches, keyPoints1,keyPoints2, image1, image2);
+				//status = run_eight_point_algo_on_matches(good_matches, keyPoints1,keyPoints2, image1, image2);
+		} else {
+				cout << "not enough points for 8-point algo " << endl;
+			}
+
 	}
+
 	return status;
 
 
@@ -674,6 +704,7 @@ void transform_cordinates_and_send(Mat validR, Mat validT) {
 	cout << "validR type" <<validR.type() << "validT type" << validT.type() << "new camera center type" << new_camera_center.type() << endl ;
 
 	cv::Mat new_camera_center_orientation = validR.t();
+	//cv::Mat new_camera_center_orientation = validR;
 	new_camera_center_orientation.convertTo(new_camera_center_orientation, CV_32F);
 
 	TooN::SO3<float> new_camera_orientation_toon = toToonSO3(new_camera_center_orientation);
@@ -779,7 +810,16 @@ void transform_cordinates_and_send(Mat validR, Mat validT) {
 
 	//gotoCommand(com_goto.x, com_goto.y, com_goto.z, final_yaw);
 
+	float momentum_threshold=0.01;
 
+	if(current_momentum.x  < momentum_threshold && current_momentum.y < momentum_threshold && current_momentum.z < momentum_threshold ){
+		cout << "Target Achieved!!" << endl ;
+		keyboardEventReceived=false ;
+		image_2_reached=true ;
+		set_target_achieved_status();
+		reset_momentum();
+		return ;
+	}
 
 	log_go_to_command(com_goto.x,com_goto.y,com_goto.z,com_goto.yaw);
 	gotoCommand(com_goto.x,com_goto.y,com_goto.z,com_goto.yaw);
@@ -816,7 +856,7 @@ void imageCallback(const sensor_msgs::ImageConstPtr& msg) {
 			return  ;
 		}
 
-//cout << "image callback received" << endl ;
+	//cout << "image callback received" << endl ;
 
 	Mat image1 = cv_bridge::toCvShare(msg, "bgr8")->image;
 	Mat undistort_image1;
@@ -827,7 +867,7 @@ void imageCallback(const sensor_msgs::ImageConstPtr& msg) {
 
 	try {
 		pthread_mutex_lock(&image2lock);
-		if (keyboardEventReceived) {
+		if (!image_2_reached && keyboardEventReceived) {
 			cout << "going to process current frame " << endl;
 			setConsideredPose();
 
@@ -1002,6 +1042,51 @@ int run_homography_and_validate(vector<DMatch> matches,vector<KeyPoint> keyPoint
                                      
 }
 
+
+int run_eight_point_algo_on_matches1(vector<DMatch> matches,vector<KeyPoint> keyPoints1, vector<KeyPoint> keyPoints2, Mat image1, Mat image2) {
+	std::cout << "\ngoing to run 8 point algorithm to determine rotation and translation" << std::endl;
+
+	std::vector<Point2f> objPoints;
+	std::vector<Point2f> scenePoints;
+	std::vector<Point2f> img1InlierPoints;
+	std::vector<Point2f> img2InlierPoints;
+
+	int matches_size = matches.size();
+
+
+	for (int i = 0; i < matches_size; i++) {
+		int image1Idx = matches[i].queryIdx;
+		int image2Idx = matches[i].trainIdx;
+		objPoints.push_back(keyPoints1[image1Idx].pt);
+		scenePoints.push_back(keyPoints2[image2Idx].pt);
+	}
+
+	 Mat E, R, T, mask;
+
+	 E=	findEssentialMat(objPoints, scenePoints, K1, RANSAC, 0.999, 1.0);
+
+	 cout << "Essential Matrix E: " << E << endl ;
+
+	 recoverPose(E, objPoints, scenePoints, K1, R, T, mask);
+
+	 cout << "\nPose Recovered" << " \n Rotation:: " << R << "\nTranslation " << T << endl ;
+
+     Mat R1_d,R2_d,T_d;
+     cout << "Decomposing essential matrix to R and T" << endl ;
+	 decomposeEssentialMat( E, R1_d, R2_d,T_d );
+
+     cout << "\nR1=" << R1_d << "\nR2=" << R2_d << "\nT1=" << T_d << "\nT2=" << -T_d <<  endl ;
+
+
+	 Mat validR=R;
+	 Mat validT=T ;
+
+	 cout << "\nValidR=" << validR << "\nValidT=" << T << endl ;
+	 transform_cordinates_and_send(validR, validT);
+	 return 1;
+
+
+}
 
 
 int run_eight_point_algo_on_matches(vector<DMatch> matches,
@@ -1335,17 +1420,36 @@ void update_matched_image_in_status_figure(Mat matched_image){
 
 }
 
-void reset_background_with_black(int start_x, int start_y, int width,int height){
+void reset_background_with_color(int start_x, int start_y, int width,int height,int color){
 	IplImage* img1_zeros=cvCreateImage(cvSize(width,height),IPL_DEPTH_8U,3);
-	cvSet(img1_zeros, cvScalar(0,0,0));
+	if(color == 0){
+		cvSet(img1_zeros, cvScalar(0,0,0));
+	}else if (color == 1){
+		cvSet(img1_zeros, cvScalar(255,0,0));
+
+	}else if (color == 2){
+		cvSet(img1_zeros, cvScalar(0,255,0));
+
+	}
 
 	cvSetImageROI(status_image, cvRect(start_x, start_y,width,height) );
 	cvCopy(img1_zeros,status_image,NULL);
 	cvResetImageROI(status_image);
 }
 
+void set_target_achieved_status(){
+	reset_background_with_color((status_image_width/2)-1,0 ,status_image_width/2,50,2);
+
+//	string status_msg="TARGET ACHIEVED";
+	cv::Mat dstMat = cv::cvarrToMat(status_image);
+//
+//	putText(dstMat,status_msg,cvPoint(80,30), FONT_HERSHEY_PLAIN, 2, Scalar(0,0,0),1.5);
+	imshow("status_image",dstMat);
+
+}
+
 void update_command_sent_status(string command_sent){
-	reset_background_with_black((status_image_width/2)-1,0 ,status_image_width/2,50);
+	reset_background_with_color((status_image_width/2)-1,0 ,status_image_width/2,50,0);
 
 	string status_msg="Command Sent: "+ command_sent;
 	cv::Mat dstMat = cv::cvarrToMat(status_image);
@@ -1356,7 +1460,7 @@ void update_command_sent_status(string command_sent){
 }
 
 void update_command_executed_status(string command_executed){
-	reset_background_with_black((status_image_width/2)-1,25,status_image_width/2,25);
+	reset_background_with_color((status_image_width/2)-1,25,status_image_width/2,25,0);
 	string status_msg="Command Executed: "+ command_executed;
 
 	cv::Mat dstMat = cv::cvarrToMat(status_image);
@@ -1367,10 +1471,10 @@ void update_command_executed_status(string command_executed){
 
 void update_quad_status_message(string status){
 
-	reset_background_with_black(0,0,status_image_width/2,50);
+	reset_background_with_color(0,0,status_image_width/2,50,0);
 	cv::Mat dstMat = cv::cvarrToMat(status_image);
 
-	putText(dstMat,status,cvPoint(30,30), FONT_HERSHEY_PLAIN, 2, Scalar(255,0,0),2);
+	putText(dstMat,status,cvPoint(30,30), FONT_HERSHEY_PLAIN, 1.5, Scalar(255,0,0),2);
 	imshow("status_image",dstMat);
 
 }
@@ -1414,10 +1518,42 @@ void update_target_image_in_status_figure(Mat image2){
 
 }
 
+
+void enable_debug_mode(const std_msgs::String::ConstPtr& msg ){
+
+	debug_mode=true;
+
+	char* target_image_name= (char*)msg->data.c_str();
+	cout << "image1 is " << target_image_name << endl ;
+
+	char target_image_full_path[200] = "/usr/prakt/w041/" ;
+	strcat(target_image_full_path,target_image_name);
+	cout << "Target image full path " << target_image_full_path << endl ;
+
+	Mat	image1 = imread(target_image_full_path,CV_LOAD_IMAGE_COLOR);
+
+	if (!image1.data)                             // Check for invalid input
+	{
+			 cout << "Could not open or find the image1" << std::endl;
+
+	}
+
+	Mat undistort_image1;
+	undistort(image1,undistort_image1,K1,distCoeff);
+	image1 = undistort_image1 ;
+
+	update_current_image_in_status_figure(image1);
+	calculate(image1);
+}
+
 void targetImageCallback(const std_msgs::String::ConstPtr& msg ){
 
 	pthread_mutex_lock(&image2lock);
 
+	image_2_reached=false ;
+	keyboardEventReceived=true ;
+
+	reset_background_with_color((status_image_width/2)-1,0 ,status_image_width/2,50,0);
 	char* target_image_name= (char*)msg->data.c_str();
 	cout << "Target image is " << target_image_name << endl ;
 //
@@ -1434,23 +1570,11 @@ void targetImageCallback(const std_msgs::String::ConstPtr& msg ){
 	image2 = undistort_image2;
 
 	update_target_image_in_status_figure(image2);
-	Mat image1=imread("/usr/prakt/w041/video_seq_images3_z/frame0088.jpg", CV_LOAD_IMAGE_COLOR) ;
-
-		if (!image1.data)                             // Check for invalid input
-		{
-				 cout << "Could not open or find the image1" << std::endl;
-
-		}
-
-	Mat undistort_image1;
-	undistort(image1,undistort_image1,K1,distCoeff);
-	image1 = undistort_image1 ;
 
 	pthread_mutex_unlock(&image2lock);
 
 
 
-	calculate(image1);
 
 }
 
@@ -1506,7 +1630,7 @@ void droneposeCb(const tum_ardrone::filter_stateConstPtr statePtr) {
 	float z=quad_poseConstPtr->z;
 	float yaw=quad_poseConstPtr->yaw;
 
-	float pos_threshold=0.5;
+	float pos_threshold=0.3;
 
 	//cout <<"X: " << x << " positionT.x: " << positionT.x << " Diff: " << fabs(x - positionT.x) << endl ;
 	//cout <<"Y: " << y << " positionT.y: " << positionT.y << " Diff: " << fabs(y - positionT.y) << endl ;
@@ -1525,11 +1649,16 @@ void droneposeCb(const tum_ardrone::filter_stateConstPtr statePtr) {
 			double diff_time=current_time-target_pose_achieved_time;
 			//cout << "Diff time for pose within target pose" << diff_time << endl ;
 			if(diff_time >= 5 ){
-				char buf[50];
-				sprintf(buf, "%f %f %f %f", statePtr->x, statePtr->y, statePtr->z, statePtr->yaw);
-				string status_msg(buf) ;
-				//cout << "Pose achieved!!!" << endl ;
-				update_command_executed_status(status_msg);
+				if(!image_2_reached){
+					char buf[50];
+					sprintf(buf, "%f %f %f %f", statePtr->x, statePtr->y, statePtr->z, statePtr->yaw);
+					string status_msg(buf) ;
+				    update_command_executed_status(status_msg);
+				}
+
+				ros::Duration d(1);
+				//d.sleep();
+				keyboardEventReceived=true ;
 			}
 
 		}
@@ -1550,7 +1679,11 @@ void droneposeCb(const tum_ardrone::filter_stateConstPtr statePtr) {
 
 }
 
-
+void reset_momentum(){
+	current_momentum.x = 1.0;
+	current_momentum.y = 1.0;
+	current_momentum.z = 1.0;
+}
 
 int main(int argc, char **argv) {
 
@@ -1558,13 +1691,7 @@ int main(int argc, char **argv) {
 
 
 	ros::NodeHandle nh;
-//	cv::namedWindow("matches_after_ratio_test",cv::WINDOW_NORMAL);
-	//cv::startWindowThread();
-//
-//	//cv::namedWindow("matches", cv::WINDOW_NORMAL);
-//	//cv::startWindowThread();
-//	cv::namedWindow("good_matches", cv::WINDOW_NORMAL);
-//	cv::startWindowThread();
+
 
 	cv::namedWindow("warped_image_1", cv::WINDOW_NORMAL);
 	cv::startWindowThread();
@@ -1573,47 +1700,13 @@ int main(int argc, char **argv) {
 	cv::namedWindow("status_image", cv:: WINDOW_AUTOSIZE );
 	cv::startWindowThread();
 
+	reset_momentum();
 
-//
-//	//
-//
-	//Mat K1 = Mat(3,3, CV_32F, cvScalar(0.));
-
-
-//
-//	//to check opencv version //compatibe with 2 not 3
 	if (CV_MAJOR_VERSION < 3) {
 		cout << "less than 3" << endl;
 	} else {
 		cout << "MORE than 3" << endl;
 	}
-//
-////		cv::namedWindow("image1",cv::WINDOW_NORMAL);
-////		cv::startWindowThread();
-////		imshow("image1",image1);
-//
-////267
-	current_momentum.x = 1.0;
-	current_momentum.y = 1.0;
-	current_momentum.z = 1.0;
-//	image2 = imread("/usr/prakt/w041/video_seq_images3_z/frame0158.jpg",
-//			CV_LOAD_IMAGE_COLOR); // Read the file
-//
-//	if (!image2.data)                             // Check for invalid input
-//	{
-//		cout << "Could not open or find the image2" << std::endl;
-//		return 0;
-//	}
-
-	Mat image1=imread("/usr/prakt/w041/video_seq_images3_z/frame0088.jpg", CV_LOAD_IMAGE_COLOR) ;
-
-	if (!image1.data)                             // Check for invalid input
-	{
-			 cout << "Could not open or find the image1" << std::endl;
-                			return 0;
-	}
-
-
 
 
 	status_image=cvCreateImage(cvSize(status_image_width,status_image_height),IPL_DEPTH_8U,3);
@@ -1622,8 +1715,8 @@ int main(int argc, char **argv) {
 	putText(dstMat,"Quadcopter View",cvPoint(30,350), FONT_HERSHEY_PLAIN, 2, Scalar(0,0,255,255),2);
 	putText(dstMat,"Target View",cvPoint(670,350), FONT_HERSHEY_PLAIN, 2, Scalar(0,0,255,255),2);
 
-		//cvShowImage( "status_image", dst );
 	imshow("status_image",dstMat);
+
 
 	vector<float> distCoeff;// = [-0.525878 0.321315 0.000212 -0.000429 0.000000];
 		// 1
@@ -1661,19 +1754,45 @@ int main(int argc, char **argv) {
 	 	c_x = 332.648207;
 	 	c_y = 171.726625;
 		scew = 0.0;
+
+		K1.at<float>(0, 0) = focal_length_x;
+		K1.at<float>(0, 1) = scew;
+		K1.at<float>(0, 2) = c_x;
+
+		K1.at<float>(1, 1) = focal_length_y;
+		K1.at<float>(1, 2) = c_y;
 	
-	K1.at<float>(0, 0) = focal_length_x;
-	K1.at<float>(0, 1) = scew;
-	K1.at<float>(0, 2) = c_x;
+		K1.at<float>(2, 2) = 1;
 
-	K1.at<float>(1, 1) = focal_length_y;
-	K1.at<float>(1, 2) = c_y;
+		image_transport::ImageTransport it(nh);
 
-	K1.at<float>(2, 2) = 1;
+		image_transport::Subscriber sub = it.subscribe("/ardrone/front/image_raw",	1, imageCallback);
 
-	Mat undistort_image1;
-	undistort(image1,undistort_image1,K1,distCoeff);
-	image1 = undistort_image1 ;
+
+		pub_com = nh.advertise<std_msgs::String>("tum_ardrone/com", 50);
+		pub_clear_com = nh.advertise<std_msgs::String>("drone_autopilot/clearCommands", 50);
+		ros::Subscriber dronepose_sub = nh.subscribe("ardrone/predictedPose", 10, droneposeCb);
+		ros::Subscriber sub1 = nh.subscribe("photo_goal/force", 1, keyboardCallback);
+		ros::Subscriber target_image_sub = nh.subscribe("photo_goal/target_image", 10, targetImageCallback);
+
+		ros::Subscriber enable_debug_mode_sub = nh.subscribe("photo_goal/source_image", 10, enable_debug_mode);
+		ros::spin();
+
+
+
+
+	//	Mat image1=imread("/usr/prakt/w041/video_seq_images3_z/frame0088.jpg", CV_LOAD_IMAGE_COLOR) ;
+	//
+	//	if (!image1.data)                             // Check for invalid input
+	//	{
+	//			 cout << "Could not open or find the image1" << std::endl;
+	//                			return 0;
+	//	}
+
+
+//	Mat undistort_image1;
+//	undistort(image1,undistort_image1,K1,distCoeff);
+//	image1 = undistort_image1 ;
 
 
 
@@ -1685,17 +1804,9 @@ int main(int argc, char **argv) {
 //
 //	cout << "going to subscibe" << endl;
 
-	image_transport::ImageTransport it(nh);
-
-	image_transport::Subscriber sub = it.subscribe("/ardrone/front/image_raw",	1, imageCallback);
 
 
-	pub_com = nh.advertise<std_msgs::String>("tum_ardrone/com", 50);
-	ros::Subscriber dronepose_sub = nh.subscribe("ardrone/predictedPose", 10,
-			droneposeCb);
-	ros::Subscriber sub1 = nh.subscribe("photo_goal/force", 1, keyboardCallback);
-	ros::Subscriber target_image_sub = nh.subscribe("photo_goal/target_image", 10,
-                        targetImageCallback);
+
 
 	//calculate(image1);
 	//Mat validR = Mat::eye(3, 3, CV_32F);
@@ -1716,7 +1827,7 @@ int main(int argc, char **argv) {
 //	cout << "Aft" << endl ;
 	//transform_cordinates_and_send(validR, validT);
 
-	ros::spin();
+
 
 }
 
@@ -1726,3 +1837,25 @@ int main(int argc, char **argv) {
 
 // imshow( "Display window", output );
 // imshow( "Display window", output );                   // Show our image inside it.
+
+
+//	cout << "\nPoints1 Matrix Size Rows::" << points1Matrix->rows << "\nCols::"
+//			<< points1Matrix->cols << endl;
+
+//	CvMat* fundMatr;
+//	CvMat* status ;
+
+//	fundMatr = cvCreateMat(3, 3, CV_32F);
+//	status = cvCreateMat(1,matches_size,CV_8UC1);
+
+	//see opencv manual for other options in computing the fundamental matrix
+//	int num = cvFindFundamentalMat(points1Matrix, points2Matrix, fundMatr,
+//	CV_FM_RANSAC, 1.0, 0.9999,status);
+
+//		cv::Mat fMatrix=fundMatr ;
+
+
+
+	//printf("\nFundamental matrix was found\n ");
+	//cout << fMatrix << "\n" << endl ;
+////////////////////////////////////////////////
